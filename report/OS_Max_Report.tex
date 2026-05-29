@@ -1,0 +1,58 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\title{OS-Max: Maximizing Operating System Capabilities for High-Frequency Trading}
+\author{Elia Zonta}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report details the architectural design and system optimizations of OS-Max (HFT Signal Engine), an educational C++20 project aimed at exploring low-latency trading concepts. While acknowledging the limitations of standard operating systems compared to institutional kernel-bypass setups, this project implements advanced concurrency patterns, cache-aligned data structures, and hardware-level tuning to squeeze maximum performance from available hardware.
+\end{abstract}
+
+\section{Introduction}
+High-Frequency Trading (HFT) requires deterministic execution, minimal latency, and zero-allocation critical paths. The OS-Max project demonstrates how to approach these requirements on a standard operating system (macOS/Linux) by applying strict memory semantics, thread pinning, and avoiding system calls during hot-path execution. 
+
+\section{System Architecture}
+The engine operates on three dedicated threads, communicating via lock-free Single-Producer Single-Consumer (SPSC) ring buffers.
+\begin{itemize}
+    \item \textbf{Feed Thread}: Ingests market data, updates the order book, and pushes raw ticks downstream.
+    \item \textbf{Signal Thread}: Aggregates ticks into Time/Volume bars, evaluates technical indicators, and triggers trading signals.
+    \item \textbf{Telemetry Thread}: Decoupled from the critical path, formatting and broadcasting ZeroMQ messages for real-time monitoring.
+\end{itemize}
+
+\section{Low-Latency Techniques Implemented}
+\subsection{Lock-Free Data Structures}
+The \texttt{SPSCQueue} uses \texttt{std::atomic} operations with strict \texttt{acquire} and \texttt{release} memory ordering. This allows data transfer between the Feed and Signal threads without the context-switching overhead of mutexes.
+
+\subsection{Cache Optimization and False Sharing Avoidance}
+Key structures (such as \texttt{Tick} and \texttt{OrderBook}) are explicitly aligned using \texttt{alignas(CACHE\_LINE)}. In the \texttt{SPSCQueue}, the head and tail atomic pointers are padded into separate cache lines to prevent false sharing between producer and consumer cores.
+
+\subsection{Hardware Tuning}
+The engine provides a \texttt{run.sh} utility that applies Linux-specific optimizations when run as root:
+\begin{itemize}
+    \item Disabling CPU C-states via \texttt{/dev/cpu\_dma\_latency} to prevent wake-up latency.
+    \item Setting the CPU frequency governor to \texttt{performance}.
+    \item Binding threads to specific NUMA nodes and logical cores (\texttt{taskset}, \texttt{numactl}).
+    \item Rerouting IRQs away from the pinned engine cores.
+\end{itemize}
+
+\section{Identified Areas for Improvement}
+Despite the robust architecture, several areas were identified for further enhancement:
+\begin{enumerate}
+    \item \textbf{SIMD Mathematics Integrity}: The AVX2 implementation for Exponential Moving Averages (EMA) incorrectly vectorizes across the time series instead of computing sequentially.
+    \item \textbf{Process Lifecycle Management}: The engine lacks POSIX signal handlers (e.g., \texttt{SIGINT}) and spins indefinitely in the main thread, resulting in abrupt termination and preventing graceful resource cleanup.
+    \item \textbf{Queue Spin-locking}: Over-saturation of queues can lead to indefinite spin-locks; implementing a yield or ring-buffer overwrite mechanism for telemetry would improve resilience.
+\end{enumerate}
+
+\section{Conclusion}
+OS-Max successfully showcases a hobbyist implementation of institutional HFT concepts. While limited by the POSIX networking stack and non-real-time kernel scheduling of macOS/standard Linux, the application of cache-aware C++20 code and lock-free concurrency achieves commendable latency optimization.
+
+\end{document}
