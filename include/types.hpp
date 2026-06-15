@@ -4,27 +4,29 @@
 // Prevent false sharing across CPU cores
 constexpr int CACHE_LINE = 64;
 
+constexpr int64_t PRICE_SCALE = 1'000'000;
+
 // ─────────────────────────────────────────────────────────────
 //  Market Data Types
 // ─────────────────────────────────────────────────────────────
 
 struct alignas(CACHE_LINE) Tick
 {
-    double price;
-    double bid;
-    double ask;
-    double last_size;
-    uint64_t ts_ns;
+    int64_t price;
+    int64_t bid;
+    int64_t ask;
+    uint32_t last_size;
     uint32_t seq;
+    uint64_t ts_ns;
     uint16_t symbol_id;
     uint8_t side;
-    uint8_t _pad[17];
+    uint8_t _pad[21];
 };
 static_assert(sizeof(Tick) == CACHE_LINE, "Tick must fit exactly in one cache line");
 
 struct alignas(32) Bar
 {
-    float open, high, low, close;
+    int64_t open, high, low, close;
     uint32_t volume;
     uint64_t ts_open_ns;
     uint64_t ts_close_ns;
@@ -76,9 +78,9 @@ struct alignas(32) Signal
 {
     SignalType type;
     uint8_t strength;
-    float entry_price;
-    float stop_loss;
-    float take_profit;
+    int64_t entry_price;
+    int64_t stop_loss;
+    int64_t take_profit;
     uint64_t ts_ns;
     uint64_t tick_ts_ns;
 };

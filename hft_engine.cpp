@@ -11,7 +11,8 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <zmq.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 // Platform Compatibility
 #if defined(__x86_64__) || defined(_M_X64)
@@ -26,6 +27,7 @@
 #include "include/spsc_queue.hpp"
 #include "include/indicators.hpp"
 #include "include/strategy.hpp"
+#include "include/feed.hpp"
 #include "src/strategies/my_strategy.hpp"
 
 // ─────────────────────────────────────────────────────────────
@@ -74,17 +76,17 @@ static void pin_thread(int core)
 // ─────────────────────────────────────────────────────────────
 
 constexpr int BOOK_LEVELS = 64;
-constexpr double TICK_SIZE = 0.01;
+constexpr int64_t TICK_SIZE = 10000;
 struct Level
 {
-    double price;
+    int64_t price;
     uint64_t qty;
 };
 
 class alignas(CACHE_LINE) OrderBook
 {
 public:
-    void reset(double mid) noexcept
+    void reset(int64_t mid) noexcept
     {
         mid_price_ = mid;
         for (int i = 0; i < BOOK_LEVELS; i++)
@@ -93,7 +95,7 @@ public:
             asks_[i] = {mid + (i + 1) * TICK_SIZE, 0};
         }
     }
-    void update_bid(double price, uint64_t qty) noexcept
+    void update_bid(int64_t price, uint64_t qty) noexcept
     {
         int idx = (int)((mid_price_ - price) / TICK_SIZE) - 1;
         if (idx >= 0 && idx < BOOK_LEVELS)
@@ -102,7 +104,7 @@ public:
             bids_[idx].price = price;
         }
     }
-    void update_ask(double price, uint64_t qty) noexcept
+    void update_ask(int64_t price, uint64_t qty) noexcept
     {
         int idx = (int)((price - mid_price_) / TICK_SIZE) - 1;
         if (idx >= 0 && idx < BOOK_LEVELS)
@@ -113,7 +115,7 @@ public:
     }
 
 private:
-    double mid_price_{0.0};
+    int64_t mid_price_{0};
     Level bids_[BOOK_LEVELS];
     Level asks_[BOOK_LEVELS];
 };
@@ -133,6 +135,13 @@ public:
             min_ = lat;
         if (lat > max_)
             max_ = lat;
+            
+        if (lat < 250) bins_[0]++;
+        else if (lat < 500) bins_[1]++;
+        else if (lat < 1000) bins_[2]++;
+        else if (lat < 2000) bins_[3]++;
+        else if (lat < 5000) bins_[4]++;
+        else bins_[5]++;
     }
     uint64_t avg_ns() const noexcept { return head_ == 0 ? 0 : sum_ / std::min(head_, (uint64_t)LAT_SAMPLES); }
     uint64_t min_ns() const noexcept { return min_; }
@@ -144,11 +153,24 @@ public:
         std::nth_element(buf, buf + n * 99 / 100, buf + n);
         return buf[n * 99 / 100];
     }
+    
+    void print_histogram() const noexcept
+    {
+        printf("\n=== Tick-to-Signal Latency Histogram ===\n");
+        printf("  < 250 ns    : %llu\n", (unsigned long long)bins_[0]);
+        printf("  250-500 ns  : %llu\n", (unsigned long long)bins_[1]);
+        printf("  500-1000 ns : %llu\n", (unsigned long long)bins_[2]);
+        printf("  1-2 us      : %llu\n", (unsigned long long)bins_[3]);
+        printf("  2-5 us      : %llu\n", (unsigned long long)bins_[4]);
+        printf("  > 5 us      : %llu\n", (unsigned long long)bins_[5]);
+        printf("========================================\n");
+    }
 
 private:
     uint64_t samples_[LAT_SAMPLES]{};
     uint64_t head_{0}, sum_{0};
     uint64_t min_{UINT64_MAX}, max_{0};
+    uint64_t bins_[6]{0};
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -168,12 +190,12 @@ struct TelemetryMsg
     {
         struct
         {
-            double price, bid, ask;
+            int64_t price, bid, ask;
             uint64_t ts_ns;
         } tick;
         struct
         {
-            float o, h, l, c;
+            int64_t o, h, l, c;
             uint32_t vol;
             uint64_t ts;
         } bar;
@@ -181,37 +203,79 @@ struct TelemetryMsg
         {
             SignalType type;
             uint8_t strength;
-            float entry, sl, tp;
+            int64_t entry, sl, tp;
             uint64_t lag_ns;
         } sig;
         struct
         {
             uint64_t tick_count, signal_count;
             uint64_t lat_avg, lat_min, lat_p99;
+            int64_t pnl;
+            uint64_t trades, wins;
         } stats;
     };
 };
 
 using TelQueue = SPSCQueue<TelemetryMsg, 2048>;
 
-struct ZmqPublisher
+constexpr size_t SHM_SIZE = 1024 * 1024 * 16; // 16 MB
+
+struct MmapPublisher
 {
-    void *ctx{nullptr};
-    void *sock{nullptr};
-    bool init(const char *endpoint = "tcp://*:5555")
+    int fd;
+    uint8_t* base;
+    std::atomic<uint64_t>* head_ptr;
+    uint8_t* buffer;
+    size_t buffer_size;
+
+    bool init(const char *endpoint = "/tmp/hft_telemetry.mmap")
     {
-        ctx = zmq_ctx_new();
-        sock = zmq_socket(ctx, ZMQ_PUB);
-        int sndhwm = 1000;
-        zmq_setsockopt(sock, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
-        return zmq_bind(sock, endpoint) == 0;
+        fd = open(endpoint, O_RDWR | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) return false;
+        if (ftruncate(fd, SHM_SIZE) != 0) return false;
+        base = (uint8_t*)mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) return false;
+
+        head_ptr = new (base) std::atomic<uint64_t>();
+        head_ptr->store(0, std::memory_order_relaxed);
+        buffer = base + 8; // 8 bytes for head
+        buffer_size = SHM_SIZE - 8;
+        return true;
     }
-    void publish(const char *json, int len) { zmq_send(sock, json, len, ZMQ_NOBLOCK); }
+    
+    void publish(const void *data, size_t len) 
+    {
+        uint64_t h = head_ptr->load(std::memory_order_relaxed);
+        uint32_t total_len = 2 + len;
+        uint64_t offset = h % buffer_size;
+        
+        if (offset + total_len > buffer_size) {
+            uint32_t pad = buffer_size - offset;
+            if (pad >= 2) {
+                uint16_t zero = 0;
+                std::memcpy(buffer + offset, &zero, 2);
+            }
+            h += pad;
+            offset = 0;
+        }
+
+        uint16_t frame_len = len;
+        std::memcpy(buffer + offset, &frame_len, 2);
+        std::memcpy(buffer + offset + 2, data, len);
+
+        head_ptr->store(h + total_len, std::memory_order_release);
+    }
 };
 
-static void telemetry_thread_fn(TelQueue *q, ZmqPublisher *pub)
+#pragma pack(push, 1)
+struct BinTick { uint8_t kind; int64_t price, bid, ask; uint64_t ts_ns; };
+struct BinBar { uint8_t kind; int64_t o, h, l, c; uint32_t vol; uint64_t ts; };
+struct BinSignal { uint8_t kind; uint8_t type, strength; int64_t entry, sl, tp; uint64_t lag_ns; };
+struct BinStats { uint8_t kind; uint64_t t_count, s_count, l_avg, l_min, l_p99; int64_t pnl; uint64_t trades, wins; };
+#pragma pack(pop)
+
+static void telemetry_thread_fn(TelQueue *q, MmapPublisher *pub)
 {
-    char buf[512];
     TelemetryMsg msg;
     while (true)
     {
@@ -220,32 +284,83 @@ static void telemetry_thread_fn(TelQueue *q, ZmqPublisher *pub)
             usleep(100);
             continue;
         }
-        int n = 0;
         if (msg.kind == TelemetryMsg::TICK)
         {
-            n = snprintf(buf, sizeof(buf), "{\"type\":\"tick\",\"price\":%.4f,\"bid\":%.4f,\"ask\":%.4f,\"ts_ns\":%llu}",
-                         msg.tick.price, msg.tick.bid, msg.tick.ask, (unsigned long long)msg.tick.ts_ns);
+            BinTick b{0, msg.tick.price, msg.tick.bid, msg.tick.ask, msg.tick.ts_ns};
+            pub->publish(&b, sizeof(b));
         }
         else if (msg.kind == TelemetryMsg::BAR)
         {
-            n = snprintf(buf, sizeof(buf), "{\"type\":\"bar\",\"open\":%.4f,\"high\":%.4f,\"low\":%.4f,\"close\":%.4f,\"volume\":%u,\"ts\":%llu}",
-                         msg.bar.o, msg.bar.h, msg.bar.l, msg.bar.c, msg.bar.vol, (unsigned long long)msg.bar.ts);
+            BinBar b{1, msg.bar.o, msg.bar.h, msg.bar.l, msg.bar.c, msg.bar.vol, msg.bar.ts};
+            pub->publish(&b, sizeof(b));
         }
         else if (msg.kind == TelemetryMsg::SIGNAL)
         {
-            n = snprintf(buf, sizeof(buf), "{\"type\":\"signal\",\"signal_type\":\"%s\",\"strength\":%u,\"entry\":%.4f,\"sl\":%.4f,\"tp\":%.4f,\"lag_ns\":%llu}",
-                         signal_name(msg.sig.type), msg.sig.strength, msg.sig.entry, msg.sig.sl, msg.sig.tp, (unsigned long long)msg.sig.lag_ns);
+            BinSignal b{2, (uint8_t)msg.sig.type, msg.sig.strength, msg.sig.entry, msg.sig.sl, msg.sig.tp, msg.sig.lag_ns};
+            pub->publish(&b, sizeof(b));
         }
         else if (msg.kind == TelemetryMsg::STATS)
         {
-            n = snprintf(buf, sizeof(buf), "{\"type\":\"stats\",\"tick_count\":%llu,\"signal_count\":%llu,\"lat_avg_ns\":%llu,\"lat_min_ns\":%llu,\"lat_p99_ns\":%llu}",
-                         (unsigned long long)msg.stats.tick_count, (unsigned long long)msg.stats.signal_count,
-                         (unsigned long long)msg.stats.lat_avg, (unsigned long long)msg.stats.lat_min, (unsigned long long)msg.stats.lat_p99);
+            BinStats b{3, msg.stats.tick_count, msg.stats.signal_count, msg.stats.lat_avg, msg.stats.lat_min, msg.stats.lat_p99, msg.stats.pnl, msg.stats.trades, msg.stats.wins};
+            pub->publish(&b, sizeof(b));
         }
-        if (n > 0)
-            pub->publish(buf, n);
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Execution Simulator
+// ─────────────────────────────────────────────────────────────
+class ExecutionSimulator {
+    int64_t position_qty{0};
+    int64_t entry_price{0};
+    int64_t stop_loss{0};
+    int64_t take_profit{0};
+    int64_t realized_pnl{0};
+    uint64_t total_trades{0};
+    uint64_t winning_trades{0};
+
+public:
+    void on_tick(const Tick& tick) {
+        if (position_qty > 0) {
+            if (tick.bid <= stop_loss || tick.bid >= take_profit) {
+                close_position(tick.bid);
+            }
+        } else if (position_qty < 0) {
+            if (tick.ask >= stop_loss || tick.ask <= take_profit) {
+                close_position(tick.ask);
+            }
+        }
+    }
+
+    void on_signal(const Signal& sig, const Tick& tick) {
+        if (position_qty != 0) return; 
+        
+        bool is_long = (sig.type == SignalType::LONG_EMA_CROSS || sig.type == SignalType::LONG_MOMENTUM || sig.type == SignalType::LONG_RSI_OVERSOLD || sig.type == SignalType::LONG_VWAP_RECLAIM);
+        
+        position_qty = is_long ? 1 : -1;
+        entry_price = is_long ? tick.ask : tick.bid;
+        stop_loss = sig.stop_loss;
+        take_profit = sig.take_profit;
+    }
+
+private:
+    void close_position(int64_t exit_price) {
+        int64_t pnl = position_qty > 0 ? (exit_price - entry_price) : (entry_price - exit_price);
+        realized_pnl += pnl;
+        total_trades++;
+        if (pnl > 0) winning_trades++;
+        
+        position_qty = 0;
+        entry_price = 0;
+        stop_loss = 0;
+        take_profit = 0;
+    }
+    
+public:
+    int64_t get_pnl() const { return realized_pnl; }
+    uint64_t get_trades() const { return total_trades; }
+    uint64_t get_wins() const { return winning_trades; }
+};
 
 // ─────────────────────────────────────────────────────────────
 //  SECTION 4 — Threads & Main
@@ -264,7 +379,8 @@ struct Engine
     IndicatorEngine indicators;
     OrderBook order_book;
     LatencyTracker latency;
-    ZmqPublisher zmq_pub;
+    ExecutionSimulator exec_sim;
+    MmapPublisher mmap_pub;
 
     std::atomic<bool> running{true};
     std::atomic<uint64_t> tick_count{0};
@@ -297,7 +413,10 @@ static void signal_thread(Engine *eng)
         }
 
         uint64_t t0 = now_ns();
+        if (tick.ts_ns == 0) tick.ts_ns = now_ns();
         eng->tick_count.fetch_add(1, std::memory_order_relaxed);
+
+        eng->exec_sim.on_tick(tick);
 
         eng->order_book.update_bid(tick.bid, (uint64_t)tick.last_size);
         eng->order_book.update_ask(tick.ask, (uint64_t)tick.last_size);
@@ -322,6 +441,8 @@ static void signal_thread(Engine *eng)
                 sig.tick_ts_ns = bar.ts_close_ns;
                 sig.ts_ns = now_ns();
 
+                eng->exec_sim.on_signal(sig, tick);
+
                 while (!eng->signal_q.push(sig)) { /* spin */ }
                 eng->signal_count.fetch_add(1, std::memory_order_relaxed);
 
@@ -333,59 +454,60 @@ static void signal_thread(Engine *eng)
         }
 
         eng->latency.record(t0, now_ns());
-        if (++stats_counter % 500 == 0)
+        if (++stats_counter % 50000 == 0)
         {
+            eng->latency.print_histogram();
+            
             TelemetryMsg stm;
             stm.kind = TelemetryMsg::STATS;
-            stm.stats = {eng->tick_count.load(), eng->signal_count.load(), eng->latency.avg_ns(), eng->latency.min_ns(), eng->latency.p99_ns()};
+            stm.stats = {eng->tick_count.load(), eng->signal_count.load(), eng->latency.avg_ns(), eng->latency.min_ns(), eng->latency.p99_ns(), eng->exec_sim.get_pnl(), eng->exec_sim.get_trades(), eng->exec_sim.get_wins()};
             eng->tel_q.push(stm);
         }
     }
 }
 
-static void feed_thread(Engine *eng)
+static void feed_thread(Engine *eng, FeedHandler* feed)
 {
     pin_thread(2);
-    double price = 445.00;
-    eng->order_book.reset(price);
-
-    while (eng->running.load(std::memory_order_relaxed))
-    {
-        price += (double)(rand() - RAND_MAX / 2) / (RAND_MAX * 10.0);
-        Tick t{};
-        t.price = price;
-        t.bid = price - 0.005;
-        t.ask = price + 0.005;
-        t.last_size = 100.0 + (rand() % 900);
-        t.ts_ns = now_ns();
-        while (!eng->tick_q.push(t)) { /* spin */ }
-        usleep(10);
-    }
+    feed->start(eng->tick_q, eng->running);
 }
 
-int main()
+int main(int argc, char* argv[])
 {
     calibrate_tsc();
     printf("[HFT] TSC frequency: %.3f GHz\n", rdtsc_hz / 1e9);
 
     Engine eng;
-    if (!eng.zmq_pub.init())
+    if (!eng.mmap_pub.init())
     {
-        fprintf(stderr, "[HFT] ZMQ bind failed — run 'killall hft_engine'\n");
+        fprintf(stderr, "[HFT] Mmap bind failed — check permissions for /tmp\n");
         return 1;
     }
-    printf("[HFT] ZMQ telemetry → tcp://*:5555\n");
+    printf("[HFT] Mmap telemetry → /tmp/hft_telemetry.mmap\n");
+
+    FeedHandler* feed = nullptr;
+    if (argc > 1) {
+        feed = new CsvReplayFeed(argv[1], 10);
+        printf("[HFT] Replaying CSV Feed: %s\n", argv[1]);
+    } else {
+        feed = new RandomFeed();
+        printf("[HFT] Running Random Feed\n");
+    }
 
     pthread_t feed_tid, signal_tid, tel_tid;
     pthread_create(&feed_tid, nullptr, [](void *a) -> void *
-                   { feed_thread((Engine*)a); return nullptr; }, &eng);
+                   { 
+                       auto p = (std::pair<Engine*, FeedHandler*>*)a;
+                       feed_thread(p->first, p->second); 
+                       return nullptr; 
+                   }, new std::pair<Engine*, FeedHandler*>(&eng, feed));
     pthread_create(&signal_tid, nullptr, [](void *a) -> void *
                    { signal_thread((Engine*)a); return nullptr; }, &eng);
     pthread_create(&tel_tid, nullptr, [](void *a) -> void *
                    {
-        auto* p = (std::pair<TelQueue*, ZmqPublisher*>*)a;
+        auto* p = (std::pair<TelQueue*, MmapPublisher*>*)a;
         telemetry_thread_fn(p->first, p->second);
-        return nullptr; }, new std::pair<TelQueue *, ZmqPublisher *>(&eng.tel_q, &eng.zmq_pub));
+        return nullptr; }, new std::pair<TelQueue *, MmapPublisher *>(&eng.tel_q, &eng.mmap_pub));
 
     printf("[HFT] Engine running! Launch Python Dashboard now.\n");
 

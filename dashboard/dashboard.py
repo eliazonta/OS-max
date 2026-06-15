@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-import zmq
+import os
+import mmap
 import json
 import time
 import math
+import struct
 import statistics
 from collections import deque
 from rich.live import Live
@@ -13,11 +15,12 @@ from rich.text import Text
 from rich import box
 
 class HFTDashboard:
-    def __init__(self, endpoint="tcp://127.0.0.1:5555"):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.SUB)
-        self.socket.connect(endpoint)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    def __init__(self, filepath="/tmp/hft_telemetry.mmap"):
+        self.filepath = filepath
+        self.fd = None
+        self.mmap_obj = None
+        self.local_tail = 0
+        self.buffer_size = (1024 * 1024 * 16) - 8
         
         # State
         self.latest_tick = {}
@@ -52,37 +55,83 @@ class HFTDashboard:
         gini = (2.0 * sum((i + 1) * p for i, p in enumerate(sorted_pnl)) / (n * cum_pnl)) - ((n + 1) / n)
         return gini
 
+    def connect_mmap(self):
+        while not os.path.exists(self.filepath):
+            time.sleep(0.1)
+        self.fd = os.open(self.filepath, os.O_RDONLY)
+        self.mmap_obj = mmap.mmap(self.fd, 0, prot=mmap.PROT_READ)
+        self.local_tail = struct.unpack('<Q', self.mmap_obj[0:8])[0]
+
     def process_messages(self):
-        while True:
-            try:
-                msg = self.socket.recv_string(flags=zmq.NOBLOCK)
-                data = json.loads(msg)
-                msg_type = data.get("type")
+        PRICE_SCALE = 1_000_000.0
+        if not self.mmap_obj: return
+        
+        try:
+            head = struct.unpack('<Q', self.mmap_obj[0:8])[0]
+            
+            # Prevent overrun: if we are too far behind, skip to head
+            if head - self.local_tail > self.buffer_size:
+                self.local_tail = head
                 
-                if msg_type == "tick": self.latest_tick = data
-                elif msg_type == "bar": self.latest_bar = data
-                elif msg_type == "stats": self.latest_stats = data
-                elif msg_type == "signal":
-                    self.recent_signals.appendleft(data)
-                    # ---- SIMULATED PNL FILL FOR METRICS ----
-                    # In reality, the C++ Engine sends a "Trade Closed" event here.
-                    self.total_trades += 1
-                    # Simulate 60% win rate for dashboard testing
-                    is_win = (self.total_trades % 5 != 0) 
-                    if is_win:
-                        self.winning_trades += 1
-                        sim_pnl = data.get("take_profit", 0) - data.get("entry", 0)
-                    else:
-                        sim_pnl = data.get("stop_loss", 0) - data.get("entry", 0)
+            while self.local_tail < head:
+                offset = self.local_tail % self.buffer_size
+                
+                frame_len_bytes = self.mmap_obj[8 + offset : 8 + offset + 2]
+                if len(frame_len_bytes) < 2:
+                    break
+                frame_len = struct.unpack('<H', frame_len_bytes)[0]
+                
+                if frame_len == 0:
+                    pad = self.buffer_size - offset
+                    self.local_tail += pad
+                    continue
                     
-                    self.current_equity += abs(sim_pnl) * (1 if is_win else -1)
+                msg = self.mmap_obj[8 + offset + 2 : 8 + offset + 2 + frame_len]
+                self.local_tail += 2 + frame_len
+
+                if not msg: continue
+                kind = msg[0]
+                
+                if kind == 0 and len(msg) == 33: # TICK
+                    _, price, bid, ask, ts_ns = struct.unpack('<BqqqQ', msg)
+                    self.latest_tick = {
+                        "type": "tick", "price": price/PRICE_SCALE, 
+                        "bid": bid/PRICE_SCALE, "ask": ask/PRICE_SCALE, "ts_ns": ts_ns
+                    }
+                elif kind == 1 and len(msg) == 45: # BAR
+                    _, o, h, l, c, vol, ts = struct.unpack('<BqqqqIQ', msg)
+                    self.latest_bar = {
+                        "type": "bar", "open": o/PRICE_SCALE, "high": h/PRICE_SCALE,
+                        "low": l/PRICE_SCALE, "close": c/PRICE_SCALE, "volume": vol, "ts": ts
+                    }
+                elif kind == 2 and len(msg) == 35: # SIGNAL
+                    _, sig_type_id, strength, entry, sl, tp, lag_ns = struct.unpack('<BBBqqqQ', msg)
+                    
+                    sig_names = ["NONE", "LONG_EMA_CROSS", "SHORT_EMA_CROSS", "LONG_RSI_OVERSOLD", "SHORT_RSI_OVERBOUGHT", "LONG_VWAP_RECLAIM", "SHORT_VWAP_BREAK", "LONG_MOMENTUM", "SHORT_MOMENTUM"]
+                    sig_name = sig_names[sig_type_id] if sig_type_id < len(sig_names) else "UNKNOWN"
+                    
+                    data = {
+                        "type": "signal", "signal_type": sig_name, "strength": strength,
+                        "entry": entry/PRICE_SCALE, "sl": sl/PRICE_SCALE, "tp": tp/PRICE_SCALE, "lag_ns": lag_ns
+                    }
+                    self.recent_signals.appendleft(data)
+                    
+                elif kind == 3 and len(msg) == 65: # STATS
+                    _, t_count, s_count, l_avg, l_min, l_p99, pnl, trades, wins = struct.unpack('<BQQQQQqQQ', msg)
+                    self.latest_stats = {
+                        "type": "stats", "tick_count": t_count, "signal_count": s_count,
+                        "lat_avg_ns": l_avg, "lat_min_ns": l_min, "lat_p99_ns": l_p99
+                    }
+                    self.total_trades = trades
+                    self.winning_trades = wins
+                    self.current_equity = 100000.0 + (pnl / PRICE_SCALE)
                     self.peak_equity = max(self.peak_equity, self.current_equity)
                     self.pnl_history.append(self.current_equity)
                     
-            except zmq.Again:
-                break 
-            except json.JSONDecodeError:
-                pass
+        except Exception as e:
+            with open("/tmp/dash_err.log", "a") as f:
+                import traceback
+                f.write(traceback.format_exc() + "\n")
 
     def generate_layout(self) -> Layout:
         layout = Layout()
@@ -139,6 +188,7 @@ class HFTDashboard:
         return Panel(table, title="[bold green]Latest Trade Signals", border_style="green")
 
     def run(self):
+        self.connect_mmap()
         layout = self.generate_layout()
         with Live(layout, refresh_per_second=20, screen=True):
             try:

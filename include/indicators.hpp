@@ -22,15 +22,15 @@ public:
         if (bar_start_ns_ == 0)
         {
             bar_start_ns_ = tick.ts_ns;
-            current_ = {(float)tick.price, (float)tick.price,
-                        (float)tick.price, (float)tick.price,
+            current_ = {tick.price, tick.price,
+                        tick.price, tick.price,
                         0, tick.ts_ns, tick.ts_ns};
         }
 
-        current_.high = std::max(current_.high, (float)tick.price);
-        current_.low = std::min(current_.low, (float)tick.price);
-        current_.close = (float)tick.price;
-        current_.volume += (uint32_t)tick.last_size;
+        current_.high = std::max(current_.high, tick.price);
+        current_.low = std::min(current_.low, tick.price);
+        current_.close = tick.price;
+        current_.volume += tick.last_size;
         current_.ts_close_ns = tick.ts_ns;
 
         if (tick.ts_ns - bar_start_ns_ >= dur_ns_)
@@ -57,87 +57,71 @@ class alignas(CACHE_LINE) IndicatorEngine
 {
 public:
     explicit IndicatorEngine(int ema_short = 9, int ema_long = 21, int rsi_period = 14)
-        : k_short_(2.f / (ema_short + 1)), k_long_(2.f / (ema_long + 1)), rsi_period_(rsi_period) {}
+        : k_short_(PRICE_SCALE * 2 / (ema_short + 1)), 
+          k_long_(PRICE_SCALE * 2 / (ema_long + 1)), 
+          rsi_period_(rsi_period) {}
 
     void update(const Bar &bar) noexcept
     {
-        float c = bar.close;
+        int64_t c = bar.close;
 
-        ema_short_ = ema_short_ == 0.f ? c : c * k_short_ + ema_short_ * (1.f - k_short_);
-        ema_long_ = ema_long_ == 0.f ? c : c * k_long_ + ema_long_ * (1.f - k_long_);
+        ema_short_ = ema_short_ == 0 ? c : (c * k_short_ + ema_short_ * (PRICE_SCALE - k_short_)) / PRICE_SCALE;
+        ema_long_ = ema_long_ == 0 ? c : (c * k_long_ + ema_long_ * (PRICE_SCALE - k_long_)) / PRICE_SCALE;
 
-        if (prev_close_ != 0.f)
+        if (prev_close_ != 0)
         {
-            float diff = c - prev_close_;
-            float gain = diff > 0.f ? diff : 0.f;
-            float loss = diff < 0.f ? -diff : 0.f;
+            int64_t diff = c - prev_close_;
+            int64_t gain = diff > 0 ? diff : 0;
+            int64_t loss = diff < 0 ? -diff : 0;
             avg_gain_ = (avg_gain_ * (rsi_period_ - 1) + gain) / rsi_period_;
             avg_loss_ = (avg_loss_ * (rsi_period_ - 1) + loss) / rsi_period_;
         }
         prev_close_ = c;
-        rsi_ = avg_loss_ < 1e-9f ? 100.f : 100.f - 100.f / (1.f + avg_gain_ / avg_loss_);
+        
+        if (avg_loss_ == 0) {
+            rsi_ = 100 * PRICE_SCALE;
+        } else {
+            rsi_ = (100LL * PRICE_SCALE * avg_gain_) / (avg_gain_ + avg_loss_);
+        }
 
-        float tp = (bar.high + bar.low + bar.close) / 3.f;
-        vwap_pv_ += tp * static_cast<float>(bar.volume);
-        vwap_v_ += static_cast<float>(bar.volume);
-        vwap_ = vwap_v_ > 0.f ? vwap_pv_ / vwap_v_ : c;
+        int64_t tp = (bar.high + bar.low + bar.close) / 3;
+        vwap_pv_ += (unsigned __int128)tp * bar.volume;
+        vwap_v_ += bar.volume;
+        vwap_ = vwap_v_ > 0 ? (int64_t)(vwap_pv_ / vwap_v_) : c;
 
-        if (prev_high_ != 0.f)
+        if (prev_high_ != 0)
         {
-            float tr = std::max(bar.high - bar.low,
-                                std::max(std::abs(bar.high - prev_close_),
-                                         std::abs(bar.low - prev_close_)));
-            atr_ = atr_ == 0.f ? tr : tr * k_short_ + atr_ * (1.f - k_short_);
+            int64_t tr = std::max(bar.high - bar.low,
+                                  std::max(std::abs(bar.high - prev_close_),
+                                           std::abs(bar.low - prev_close_)));
+            atr_ = atr_ == 0 ? tr : (tr * k_short_ + atr_ * (PRICE_SCALE - k_short_)) / PRICE_SCALE;
         }
         prev_high_ = bar.high;
         prev_low_ = bar.low;
         bar_count_++;
     }
 
-    void batch_ema_avx2(const float *closes, int n) noexcept
-    {
-#if defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
-        __m256 k_s = _mm256_set1_ps(k_short_);
-        __m256 k_l = _mm256_set1_ps(k_long_);
-        __m256 one = _mm256_set1_ps(1.f);
-        __m256 e_s = _mm256_set1_ps(closes[0]);
-        __m256 e_l = _mm256_set1_ps(closes[0]);
-        for (int b = 0; b < n / 8; b++)
-        {
-            __m256 c = _mm256_loadu_ps(closes + b * 8);
-            e_s = _mm256_fmadd_ps(c, k_s, _mm256_mul_ps(e_s, _mm256_sub_ps(one, k_s)));
-            e_l = _mm256_fmadd_ps(c, k_l, _mm256_mul_ps(e_l, _mm256_sub_ps(one, k_l)));
-        }
-        float buf_s[8], buf_l[8];
-        _mm256_storeu_ps(buf_s, e_s);
-        _mm256_storeu_ps(buf_l, e_l);
-        ema_short_ = buf_s[7];
-        ema_long_ = buf_l[7];
-#else
-        for (int i = 0; i < n; i++)
-        {
-            ema_short_ = closes[i] * k_short_ + ema_short_ * (1.f - k_short_);
-            ema_long_ = closes[i] * k_long_ + ema_long_ * (1.f - k_long_);
-        }
-#endif
-    }
+    // Removed AVX batch processing for now due to fixed point arithmetic transition
+    void batch_ema_avx2(const float *, int) noexcept {}
 
-    float ema_short() const noexcept { return ema_short_; }
-    float ema_long() const noexcept { return ema_long_; }
-    float rsi() const noexcept { return rsi_; }
-    float vwap() const noexcept { return vwap_; }
-    float atr() const noexcept { return atr_; }
+    int64_t ema_short() const noexcept { return ema_short_; }
+    int64_t ema_long() const noexcept { return ema_long_; }
+    int64_t rsi() const noexcept { return rsi_; }
+    int64_t vwap() const noexcept { return vwap_; }
+    int64_t atr() const noexcept { return atr_; }
     int bar_count() const noexcept { return bar_count_; }
     bool ready() const noexcept { return bar_count_ >= rsi_period_ + 2; }
 
 private:
-    const float k_short_, k_long_;
+    const int64_t k_short_, k_long_;
     const int rsi_period_;
-    float ema_short_{0.f}, ema_long_{0.f};
-    float rsi_{50.f};
-    float avg_gain_{0.f}, avg_loss_{0.f};
-    float vwap_{0.f}, vwap_pv_{0.f}, vwap_v_{0.f};
-    float atr_{0.f};
-    float prev_close_{0.f}, prev_high_{0.f}, prev_low_{0.f};
+    int64_t ema_short_{0}, ema_long_{0};
+    int64_t rsi_{50 * PRICE_SCALE};
+    int64_t avg_gain_{0}, avg_loss_{0};
+    int64_t vwap_{0};
+    unsigned __int128 vwap_pv_{0};
+    uint64_t vwap_v_{0};
+    int64_t atr_{0};
+    int64_t prev_close_{0}, prev_high_{0}, prev_low_{0};
     int bar_count_{0};
 };
