@@ -1,6 +1,6 @@
 # OS-Max High-Frequency Trading Engine
 
-An institutional-grade, highly-optimized High-Frequency Trading (HFT) C++ framework designed for microsecond latency strategy execution.
+An (non) institutional-grade, highly-optimized High-Frequency Trading (HFT) C++ framework designed for low latency strategy execution.
 
 ## Architecture
 
